@@ -27,6 +27,12 @@
 #include <memory>
 #include <cassert>
 
+#if __cpp_if_constexpr >= 201606
+#define IF_CONSTEXPR if constexpr
+#else
+#define IF_CONSTEXPR if
+#endif
+
 // Some guarantees:
 // 1. buf_ is never empty
 // 2. &buf_.back().second == wpos
@@ -40,7 +46,7 @@
 //10. one_block_left_ is read or written only by the consumer
 //11. When one_block_left_ is false, there must be more than one block. No guarantee when one_block_left_ is true
 
-template <int mode, int notify_interval = 1, int wait_timeout = 0>
+template <int mode, unsigned notify_interval = 1, unsigned long long wait_timeout = 0, unsigned wait_spin_cv_num = 1>
 class SPSCBlockBufferBase {
  public:
     SPSCBlockBufferBase() = default;
@@ -56,8 +62,8 @@ class SPSCBlockBufferBase {
         wpos_private_ = 0;
         one_block_left_ = true;
         if (block_size == -1) {
-            //block_size_ = sysconf(_SC_PAGESIZE);
-            block_size_ = sysconf(_SC_PAGESIZE) * 100;
+            block_size_ = sysconf(_SC_PAGESIZE);
+            //block_size_ = sysconf(_SC_PAGESIZE) * 100;
         } else {
             block_size_ = block_size;
         }
@@ -265,13 +271,13 @@ class SPSCBlockBufferBase {
     }
 
     void notify() {
-        if (mode == 2 || mode == 3) {
+        IF_CONSTEXPR(mode == 2 || mode == 3) {
             std::unique_lock<std::mutex> lk(mtx_);
             // Atomic is still needed because empty() does not acquire the lock
             __atomic_store_n(wpos_, wpos_private_, __ATOMIC_RELEASE);
             lk.unlock();
             cv_.notify_one();
-        } else if (mode == 4) {
+        } else IF_CONSTEXPR(mode == 4) {
             ++notify_counter;
             if (notify_counter == notify_interval) {
                 notify_counter = 0;
@@ -283,7 +289,7 @@ class SPSCBlockBufferBase {
             } else {
                 __atomic_store_n(wpos_, wpos_private_, __ATOMIC_RELEASE);
             }
-        } else if (mode == 5) {
+        } else IF_CONSTEXPR(mode == 5) {
             __atomic_store_n(wpos_, wpos_private_, __ATOMIC_RELEASE);
             uint64_t tmp = 1;
             ::write(eventfd_, &tmp, sizeof(tmp));
@@ -369,7 +375,7 @@ class SPSCBlockBufferBase {
     }
 
     inline void pop_block_if_needed(size_t size) {
-        if (mode == 0) {
+        IF_CONSTEXPR(mode == 0) {
             if (one_block_left_) {
                 if (!check_one_block_left() && buf_.front().second - rpos_ < size) {
                     pop_block();
@@ -403,7 +409,7 @@ class SPSCBlockBufferBase {
                 }
             }
         } else if (mode == 2) {*/
-        } else if (mode == 1 || mode == 2 || mode == 3 || mode == 4) {
+        } else IF_CONSTEXPR(mode == 1 || mode == 2 || mode == 3 || mode == 4) {
             if (one_block_left_) {
                 wait([&]{return !(check_one_block_left() && __atomic_load_n(&buf_.front().second, __ATOMIC_ACQUIRE) - rpos_ < size);});
                 if (__atomic_load_n(&buf_.front().second, __ATOMIC_ACQUIRE) - rpos_ < size) {
@@ -425,25 +431,25 @@ class SPSCBlockBufferBase {
 
     template <typename PredicateT>
     inline void wait(PredicateT pred) {
-        if (mode == 1) {
+        IF_CONSTEXPR(mode == 1) {
             while (!pred()); // TODO: it seems that the NOT operation takes some time, but for now keep it for easy maintainence
-        } else if (mode == 2) {
+        } else IF_CONSTEXPR(mode == 2) {
             if (!pred()) {
                 std::unique_lock<std::mutex> lk(mtx_);
                 cv_.wait(lk, pred);
             }
-        } else if (mode == 3) {
-            for (int i = 0; i < 106; ++i) {
+        } else IF_CONSTEXPR(mode == 3) {
+            for (int i = 0; i < wait_spin_cv_num; ++i) {
                 if (pred()) {
                     return;
                 }
             }
             std::unique_lock<std::mutex> lk(mtx_);
             cv_.wait(lk, pred);
-        } else if (mode == 4) {
+        } else IF_CONSTEXPR(mode == 4) {
             while (!pred()) {
                 std::unique_lock<std::mutex> lk(mtx_);
-                cv_.wait_for(lk, std::chrono::milliseconds(wait_timeout), pred);
+                cv_.wait_for(lk, std::chrono::microseconds(wait_timeout), pred);
             }
         }
     }
@@ -468,8 +474,10 @@ class SPSCBlockBufferBase {
 using SPSCBlockBuffer = SPSCBlockBufferBase<0>;
 using SPSCBlockBufferSpin = SPSCBlockBufferBase<1>;
 using SPSCBlockBufferCV = SPSCBlockBufferBase<2>;
-using SPSCBlockBufferSpinCV = SPSCBlockBufferBase<3>;
 using SPSCBlockBufferEventFd = SPSCBlockBufferBase<5>;
 
-template <int notify_interval, int wait_timeout>
+template <unsigned wait_spin_cv_num>
+using SPSCBlockBufferSpinCV = SPSCBlockBufferBase<3, 1, 0, wait_spin_cv_num>;
+
+template <unsigned notify_interval, unsigned long long wait_timeout>
 using SPSCBlockBufferCVTimeout = SPSCBlockBufferBase<4, notify_interval, wait_timeout>;
